@@ -4,8 +4,10 @@ interface CacheEntry<T> {
   ttl: number;
 }
 
-// Module-level singleton — persists across requests in the same Node.js process
-const store = new Map<string, CacheEntry<unknown>>();
+// globalThis survives Next.js dev hot-reload across route modules
+const g = globalThis as typeof globalThis & { __dashCache?: Map<string, CacheEntry<unknown>> };
+if (!g.__dashCache) g.__dashCache = new Map();
+const store = g.__dashCache;
 
 export function getCached<T>(key: string): T | null {
   const entry = store.get(key) as CacheEntry<T> | undefined;

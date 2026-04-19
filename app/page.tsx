@@ -248,7 +248,7 @@ function AiAnalysisSection({
         </div>
         <div>
           <h2 className="text-base font-bold text-slate-100">AI วิเคราะห์สถานการณ์โลก</h2>
-          <p className="text-xs text-slate-500">วิเคราะห์จากข่าว เศรษฐกิจ และตลาดการเงินล่าสุด · Groq Llama 3.3</p>
+          <p className="text-xs text-slate-500">วิเคราะห์จากข่าว 6 ชั่วโมงล่าสุด + เศรษฐกิจ + ตลาดการเงิน · Groq Llama 3.3</p>
         </div>
       </div>
 

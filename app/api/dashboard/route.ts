@@ -30,7 +30,7 @@ async function timedFetch(url: string, timeoutMs = 20_000): Promise<Response> {
 
 async function fetchFromGdelt(): Promise<NewsArticle[]> {
   const q = encodeURIComponent('(economy OR geopolitics OR war OR climate OR trade OR technology)');
-  const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${q}&mode=artlist&maxrecords=15&format=json&timespan=24h`;
+  const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${q}&mode=artlist&maxrecords=20&format=json&timespan=6h&sort=DateDesc`;
 
   const res = await timedFetch(url);
   if (res.status === 429) throw new Error('GDELT 429');
@@ -57,7 +57,7 @@ async function fetchFromGdelt(): Promise<NewsArticle[]> {
 function parseRssFeed(xml: string, domain: string): NewsArticle[] {
   const items: NewsArticle[] = [];
   const itemBlocks = xml.match(/<item>([\s\S]*?)<\/item>/g) ?? [];
-  for (const block of itemBlocks.slice(0, 15)) {
+  for (const block of itemBlocks.slice(0, 20)) {
     const title = block.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)?.[1]
       ?? block.match(/<title>(.*?)<\/title>/)?.[1] ?? '';
     const link = block.match(/<link>(.*?)<\/link>/)?.[1]
@@ -72,7 +72,12 @@ function parseRssFeed(xml: string, domain: string): NewsArticle[] {
       language: 'English',
     });
   }
-  return items;
+  // Sort by most recent first
+  return items.sort((a, b) => {
+    if (!a.seendate) return 1;
+    if (!b.seendate) return -1;
+    return new Date(b.seendate).getTime() - new Date(a.seendate).getTime();
+  });
 }
 
 async function fetchFromRss(url: string, domain: string): Promise<NewsArticle[]> {
@@ -91,25 +96,39 @@ const RSS_FALLBACKS: Array<{ url: string; domain: string; label: string }> = [
 ];
 
 async function fetchNews(): Promise<NewsArticle[]> {
-  try {
-    const articles = await fetchFromGdelt();
-    if (articles.length > 0) return articles;
-    throw new Error('GDELT returned 0 articles');
-  } catch (gdeltErr) {
-    console.warn('[dashboard] GDELT failed, trying RSS fallbacks:', String(gdeltErr));
-  }
+  const sources: Array<Promise<NewsArticle[]>> = [
+    fetchFromGdelt(),
+    ...RSS_FALLBACKS.map(({ url, domain }) => fetchFromRss(url, domain)),
+  ];
 
-  for (const { url, domain, label } of RSS_FALLBACKS) {
-    try {
-      const articles = await fetchFromRss(url, domain);
-      console.log(`[dashboard] News loaded from ${label} (${articles.length} articles)`);
-      return articles;
-    } catch (e) {
-      console.warn(`[dashboard] ${label} RSS failed:`, String(e));
+  const results = await Promise.allSettled(sources);
+  const labels = ['GDELT', ...RSS_FALLBACKS.map((s) => s.label)];
+
+  const all: NewsArticle[] = [];
+  results.forEach((r, i) => {
+    if (r.status === 'fulfilled') {
+      console.log(`[dashboard] ${labels[i]}: ${r.value.length} articles`);
+      all.push(...r.value);
+    } else {
+      console.warn(`[dashboard] ${labels[i]} failed:`, String(r.reason).slice(0, 80));
     }
-  }
+  });
 
-  throw new Error('All news sources failed (GDELT + BBC + Al Jazeera + DW)');
+  if (all.length === 0) throw new Error('All news sources failed');
+
+  // Deduplicate by URL, then sort by most recent first
+  const seen = new Set<string>();
+  const deduped = all.filter((a) => {
+    if (seen.has(a.url)) return false;
+    seen.add(a.url);
+    return true;
+  });
+
+  return deduped.sort((a, b) => {
+    if (!a.seendate) return 1;
+    if (!b.seendate) return -1;
+    return new Date(b.seendate).getTime() - new Date(a.seendate).getTime();
+  });
 }
 
 // ─── World Bank ───────────────────────────────────────────────────────────────
@@ -255,7 +274,7 @@ async function generateAnalysis(
   const key = process.env.GROQ_API_KEY;
   if (!key) throw new Error('GROQ_API_KEY not set');
 
-  const newsList = news.slice(0, 12)
+  const newsList = news.slice(0, 15)
     .map((a, i) => `${i + 1}. ${a.title} [${a.domain}]`)
     .join('\n');
 
@@ -270,26 +289,26 @@ async function generateAnalysis(
     })
     .join(' | ');
 
-  const prompt = `คุณคือนักวิเคราะห์ระดับอาวุโสที่เชี่ยวชาญด้านภูมิรัฐศาสตร์ เศรษฐกิจโลก และตลาดการเงิน
+  const prompt = `คุณคือนักวิเคราะห์ระดับอาวุโสที่เชี่ยวชาญด้านภูมิรัฐศาสตร์ เศรษฐกิจโลก และตลาดการเงิน ทำหน้าที่เป็นศูนย์ติดตามสถานการณ์โลก (World Intelligence Monitor)
 
-ข้อมูลล่าสุด ณ วันนี้:
+ข้อมูลล่าสุด ณ ชั่วโมงนี้:
 
-[ข่าวรอบโลก 24 ชั่วโมง]
+[ข่าวรอบโลก 6 ชั่วโมงล่าสุด — เรียงจากใหม่ไปเก่า]
 ${newsList}
 
-[ข้อมูลเศรษฐกิจมหภาค - World Bank]
+[ข้อมูลเศรษฐกิจมหภาค — World Bank]
 ${econList || 'ไม่มีข้อมูล'}
 
 [ราคาตลาดการเงินล่าสุด]
 ${stockList || 'ไม่มีข้อมูล'}
 
-วิเคราะห์ข้อมูลทั้งหมดด้านบนเป็นภาษาไทย และตอบในรูปแบบ JSON เท่านั้น ห้ามมีข้อความนอก JSON:
+วิเคราะห์ข้อมูลทั้งหมดอย่างละเอียดเป็นภาษาไทย ตอบในรูปแบบ JSON เท่านั้น ห้ามมีข้อความนอก JSON:
 
 {
-  "worldNews": "สรุปข่าวรอบโลกที่สำคัญวันนี้ ระบุประเด็นหลัก 3-4 เรื่องที่กำลังเกิดขึ้น เขียนเป็นย่อหน้า 80-100 คำ",
-  "macroEconomy": "วิเคราะห์เศรษฐกิจมหภาคโลก อ้างอิงตัวเลข GDP เงินเฟ้อ การว่างงาน ของแต่ละประเทศ บอกแนวโน้มและนัยสำคัญ เขียนเป็นย่อหน้า 80-100 คำ",
-  "markets": "วิเคราะห์ตลาดหุ้น สินค้าโภคภัณฑ์ คริปโต และค่าเงิน อ้างอิงตัวเลขและเปอร์เซ็นต์การเปลี่ยนแปลง บอกว่าตลาดโดยรวมเป็นอย่างไร เขียนเป็นย่อหน้า 80-100 คำ",
-  "outlook": "วิเคราะห์ทิศทางและแนวโน้มระยะสั้น (1-4 สัปดาห์) ของประเด็นสำคัญ เช่น สงคราม ความตึงเครียดทางการค้า ทิศทางเศรษฐกิจ ความเสี่ยงที่ต้องติดตาม เขียนเป็นย่อหน้า 80-100 คำ"
+  "worldNews": "สรุปข่าวสำคัญที่เกิดขึ้นใน 6 ชั่วโมงล่าสุด ระบุทุกประเด็นหลักที่ปรากฏในข่าว บอกว่าเหตุการณ์เกิดที่ไหน มีผู้เกี่ยวข้องใคร และมีนัยสำคัญอย่างไร เขียนเชิงรายงานข่าว ละเอียด 150-200 คำ",
+  "macroEconomy": "วิเคราะห์เศรษฐกิจมหภาคเชิงลึก อ้างอิงตัวเลข GDP เงินเฟ้อ การว่างงานของแต่ละประเทศที่มีในข้อมูล เปรียบเทียบระหว่างประเทศ ชี้ให้เห็นความสัมพันธ์กับข่าวที่เกิดขึ้น และแนวโน้มที่น่ากังวล เขียนเชิงวิเคราะห์ ละเอียด 150-200 คำ",
+  "markets": "วิเคราะห์ตลาดการเงินเชิงลึก อ้างอิงตัวเลขและเปอร์เซ็นต์ทุกตัวที่มีในข้อมูล แยกวิเคราะห์ดัชนีหุ้น สินค้าโภคภัณฑ์ (ทองคำ น้ำมัน) คริปโต และค่าเงิน บอกว่าการเคลื่อนไหวสะท้อนความเชื่อมั่นนักลงทุนอย่างไร และสัมพันธ์กับข่าวใด เขียนเชิงวิเคราะห์ ละเอียด 150-200 คำ",
+  "outlook": "วิเคราะห์ทิศทางและความเสี่ยงในระยะ 1-4 สัปดาห์ข้างหน้า ครอบคลุมทุกมิติ: ภูมิรัฐศาสตร์ (สงคราม ความตึงเครียด) เศรษฐกิจ (นโยบายดอกเบี้ย การค้า) ตลาดทุน (แนวรับแนวต้าน catalyst ที่ต้องจับตา) ระบุ upside และ downside risk อย่างชัดเจน เขียนเชิงกลยุทธ์ ละเอียด 150-200 คำ"
 }`;
 
   const groq = new Groq({ apiKey: key });
@@ -299,8 +318,8 @@ ${stockList || 'ไม่มีข้อมูล'}
       { role: 'system', content: 'ตอบด้วย JSON เท่านั้น ห้ามมีข้อความอื่น ห้ามใช้ markdown code block' },
       { role: 'user', content: prompt },
     ],
-    temperature: 0.6,
-    max_tokens: 1200,
+    temperature: 0.5,
+    max_tokens: 2000,
     response_format: { type: 'json_object' },
   });
 
