@@ -187,46 +187,62 @@ type QuoteResult = {
   currency?: string;
 };
 
-type YFModule = { quote(s: string): Promise<QuoteResult> };
+type YFModule = {
+  quote(s: string): Promise<QuoteResult>;
+  suppressNotices(notices: string[]): void;
+};
 
 // Singleton — preserves the Yahoo Finance crumb/cookie across requests
 let _yfInstance: YFModule | null = null;
 async function getYFInstance(): Promise<YFModule> {
   if (_yfInstance) return _yfInstance;
   const mod = await import('yahoo-finance2');
-  const YF = mod.default as new () => YFModule;
-  _yfInstance = typeof YF === 'function' ? new YF() : (YF as unknown as YFModule);
+  const raw = mod.default as unknown as YFModule;
+  _yfInstance = raw;
+  // Suppress the one-time survey prompt from cluttering logs
+  try { _yfInstance.suppressNotices(['yahooSurvey']); } catch { /* ignore */ }
   return _yfInstance;
 }
 
+function resetYFInstance() { _yfInstance = null; }
+
 async function fetchStocks(): Promise<StockQuote[]> {
   const yf = await getYFInstance();
+  const results: StockQuote[] = [];
+  let failCount = 0;
+  let crumbFailed = false;
 
-  const settled = await Promise.allSettled(
-    SYMBOLS.map(async ({ symbol, name, nameThai, category }) => {
+  for (const { symbol, name, nameThai, category } of SYMBOLS) {
+    try {
       const q = await yf.quote(symbol);
-      const result: StockQuote = {
+      results.push({
         symbol, name, nameThai, category,
         price: q.regularMarketPrice ?? 0,
         change: q.regularMarketChange ?? 0,
         changePercent: q.regularMarketChangePercent ?? 0,
         currency: q.currency ?? 'USD',
-      };
-      return result;
-    }),
-  );
-
-  const successes = settled
-    .filter((r): r is PromiseFulfilledResult<StockQuote> => r.status === 'fulfilled')
-    .map((r) => r.value);
-
-  const failures = settled.filter((r) => r.status === 'rejected') as PromiseRejectedResult[];
-  if (failures.length > 0) {
-    console.warn(`[dashboard] ${failures.length}/${SYMBOLS.length} YF quotes failed. First error:`, failures[0].reason);
+      });
+    } catch (e) {
+      failCount++;
+      const msg = String(e);
+      if (!crumbFailed && (msg.includes('crumb') || msg.includes('429'))) {
+        crumbFailed = true;
+        // Reset singleton so next request gets a fresh crumb after rate limit window
+        resetYFInstance();
+        console.warn(`[dashboard] YF crumb/rate-limit error for ${symbol}, reset singleton`);
+      }
+    }
+    // Small delay between requests to avoid triggering Yahoo's rate limit
+    await new Promise((r) => setTimeout(r, 150));
   }
 
-  if (successes.length === 0) throw new Error(`All Yahoo Finance quotes failed: ${failures[0]?.reason}`);
-  return successes;
+  if (failCount > 0) {
+    console.warn(`[dashboard] ${failCount}/${SYMBOLS.length} YF quotes failed`);
+  }
+  if (results.length === 0) {
+    throw new Error(`All ${SYMBOLS.length} Yahoo Finance quotes failed (429/crumb)`);
+  }
+  return results;
 }
 
 // ─── Gemini summary ───────────────────────────────────────────────────────────
@@ -252,9 +268,9 @@ ${list}
 • ความยาว 150–200 คำ`;
 
   const genAI = new GoogleGenerativeAI(key);
-  // gemini-1.5-flash was removed from v1beta; use gemini-2.0-flash on v1
+  // gemini-2.0-flash-lite: higher free-tier quota than gemini-2.0-flash
   const model = genAI.getGenerativeModel(
-    { model: 'gemini-2.0-flash' },
+    { model: 'gemini-2.0-flash-lite' },
     { apiVersion: 'v1' },
   );
   const result = await model.generateContent(prompt);
