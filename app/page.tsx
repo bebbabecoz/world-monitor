@@ -12,7 +12,10 @@ import {
   Wifi,
   WifiOff,
   Sparkles,
+  LineChart,
+  Compass,
 } from 'lucide-react';
+import type { AiAnalysis } from '@/lib/types';
 import NewsCard from '@/components/NewsCard';
 import MarketTicker from '@/components/MarketTicker';
 import ChatInterface from '@/components/ChatInterface';
@@ -215,6 +218,70 @@ function SectionHeader({
   );
 }
 
+// ─── AI Analysis section ───────────────────────────────────────────────────────
+
+const AI_CARDS: Array<{
+  key: keyof AiAnalysis;
+  title: string;
+  icon: React.ElementType;
+}> = [
+  { key: 'worldNews',    title: 'ข่าวรอบโลกวันนี้',        icon: Newspaper },
+  { key: 'macroEconomy', title: 'วิเคราะห์เศรษฐกิจมหภาค', icon: TrendingUp },
+  { key: 'markets',      title: 'วิเคราะห์ตลาดหุ้น',       icon: LineChart  },
+  { key: 'outlook',      title: 'ทิศทางประเด็นสำคัญ',      icon: Compass    },
+];
+
+function AiAnalysisSection({
+  analysis,
+  loading,
+  error,
+}: {
+  analysis: AiAnalysis | null;
+  loading: boolean;
+  error?: string;
+}) {
+  return (
+    <section className="mb-6">
+      <div className="flex items-center gap-2 mb-4">
+        <div className="w-8 h-8 rounded-lg bg-brand/15 flex items-center justify-center">
+          <Sparkles size={16} className="text-brand-light" />
+        </div>
+        <div>
+          <h2 className="text-base font-bold text-slate-100">AI วิเคราะห์สถานการณ์โลก</h2>
+          <p className="text-xs text-slate-500">วิเคราะห์จากข่าว เศรษฐกิจ และตลาดการเงินล่าสุด · Groq Llama 3.3</p>
+        </div>
+      </div>
+
+      {error ? (
+        <ErrorBox message={error} />
+      ) : (
+        <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
+          {AI_CARDS.map(({ key, title, icon: Icon }) => (
+            <div key={key} className="card border-brand/20 bg-brand/5 flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                <Icon size={13} className="text-brand-light flex-shrink-0" />
+                <span className="text-xs font-semibold text-brand-light">{title}</span>
+              </div>
+              {loading ? (
+                <div className="space-y-2 flex-1">
+                  <SkeletonLine />
+                  <SkeletonLine w="w-5/6" />
+                  <SkeletonLine w="w-4/5" />
+                  <SkeletonLine w="w-3/4" />
+                </div>
+              ) : (
+                <p className="text-sm text-slate-300 leading-relaxed">
+                  {analysis?.[key] ?? 'ไม่มีข้อมูล'}
+                </p>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
 // ─── Main page ─────────────────────────────────────────────────────────────────
 
 export default function HomePage() {
@@ -329,42 +396,26 @@ export default function HomePage() {
         </div>
       )}
 
-      {/* ── 3-column layout ── */}
+      {/* ── Main layout ── */}
       <main className="max-w-[1600px] mx-auto px-4 sm:px-6 py-6">
+
+        {/* ── AI Analysis (full width) ── */}
+        <AiAnalysisSection
+          analysis={data?.aiAnalysis ?? null}
+          loading={loading}
+          error={data?.errors?.summary}
+        />
+
         <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-6">
 
           {/* ── Column 1: News ── */}
           <div className="flex flex-col gap-4">
             <SectionHeader
               icon={Newspaper}
-              title="สรุปข่าว"
-              subtitle="GDELT · วิเคราะห์โดย Gemini AI"
+              title="ข่าวรอบโลก"
+              subtitle="GDELT · BBC · Al Jazeera · DW"
               badge={data ? `${data.news.length} ข่าว` : undefined}
             />
-
-            {/* AI Summary box */}
-            <div className="card border-brand/30 bg-brand/5">
-              <div className="flex items-center gap-2 mb-3">
-                <Sparkles size={14} className="text-brand-light" />
-                <span className="text-xs font-semibold text-brand-light">
-                  AI วิเคราะห์สถานการณ์โลก
-                </span>
-              </div>
-              {loading ? (
-                <div className="space-y-2">
-                  <SkeletonLine />
-                  <SkeletonLine w="w-5/6" />
-                  <SkeletonLine w="w-4/5" />
-                  <SkeletonLine w="w-3/4" />
-                </div>
-              ) : data?.errors?.summary ? (
-                <ErrorBox message={data.errors.summary} />
-              ) : (
-                <p className="text-sm text-slate-300 leading-relaxed whitespace-pre-wrap">
-                  {data?.newsSummary ?? 'ไม่มีข้อมูลสรุปข่าว'}
-                </p>
-              )}
-            </div>
 
             {/* News cards */}
             {loading ? (
@@ -434,7 +485,7 @@ export default function HomePage() {
       <footer className="border-t border-surface-border mt-6 py-4 text-center text-xs text-slate-600">
         World Intelligence Dashboard · MIT License · Personal Project ·{' '}
         <span className="text-slate-500">
-          ข้อมูลจาก GDELT, World Bank, Yahoo Finance · AI by Google Gemini
+          ข้อมูลจาก GDELT, World Bank, Yahoo Finance · AI by Groq Llama 3.3
         </span>
       </footer>
 

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import Groq from 'groq-sdk';
 import { getCached } from '@/lib/cache';
 import type { ChatMessage, DashboardData } from '@/lib/types';
 
@@ -26,13 +26,23 @@ function buildContext(data: DashboardData | null): string {
     })
     .join('\n');
 
+  const analysis = data.aiAnalysis;
   return `=== ข้อมูล Dashboard อัปเดต: ${updated} ===
 
 [ข่าวสำคัญ]
 ${newsList}
 
-[สรุปข่าว AI]
-${data.newsSummary}
+[วิเคราะห์ข่าวโลก]
+${analysis?.worldNews ?? '-'}
+
+[วิเคราะห์เศรษฐกิจมหภาค]
+${analysis?.macroEconomy ?? '-'}
+
+[วิเคราะห์ตลาด]
+${analysis?.markets ?? '-'}
+
+[ทิศทางและแนวโน้ม]
+${analysis?.outlook ?? '-'}
 
 [ข้อมูลเศรษฐกิจโลก]
 ${econList}
@@ -42,10 +52,10 @@ ${stockList}`;
 }
 
 export async function POST(req: NextRequest) {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GROQ_API_KEY;
   if (!apiKey) {
     return NextResponse.json(
-      { error: 'ไม่พบ GEMINI_API_KEY กรุณาตั้งค่าใน .env.local' },
+      { error: 'ไม่พบ GROQ_API_KEY กรุณาตั้งค่าใน .env.local' },
       { status: 500 },
     );
   }
@@ -60,7 +70,7 @@ export async function POST(req: NextRequest) {
   const dashboardData = getCached<DashboardData>('dashboard_v1');
   const context = buildContext(dashboardData);
 
-  const systemInstruction = `คุณคือผู้ช่วย AI ชื่อ "วิเคราะห์โลก" สำหรับ World Intelligence Dashboard
+  const systemPrompt = `คุณคือผู้ช่วย AI ชื่อ "วิเคราะห์โลก" สำหรับ World Intelligence Dashboard
 คุณเชี่ยวชาญด้านข่าวสากล เศรษฐกิจโลก และตลาดการเงิน
 
 ${context}
@@ -72,21 +82,24 @@ ${context}
 4. หากถามเรื่องราคาหรือตัวเลข ให้ระบุว่าเป็นข้อมูล ณ เวลาที่บึง และแนะนำให้ตรวจสอบกับแหล่งข้อมูลหลัก
 5. ไม่แนะนำให้ซื้อขายหลักทรัพย์โดยตรง`;
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  // gemini-2.0-flash-lite: higher free-tier quota than gemini-2.0-flash
-  const model = genAI.getGenerativeModel(
-    { model: 'gemini-2.0-flash-lite', systemInstruction },
-    { apiVersion: 'v1' },
-  );
+  const groq = new Groq({ apiKey });
 
-  const geminiHistory = history.map((h) => ({
-    role: h.role === 'assistant' ? ('model' as const) : ('user' as const),
-    parts: [{ text: h.content }],
-  }));
+  const messages: Groq.Chat.ChatCompletionMessageParam[] = [
+    { role: 'system', content: systemPrompt },
+    ...history.map((h) => ({
+      role: h.role === 'assistant' ? ('assistant' as const) : ('user' as const),
+      content: h.content,
+    })),
+    { role: 'user', content: message },
+  ];
 
-  const chat = model.startChat({ history: geminiHistory });
-  const result = await chat.sendMessage(message);
-  const response = result.response.text();
+  const completion = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages,
+    temperature: 0.7,
+    max_tokens: 1024,
+  });
 
+  const response = completion.choices[0]?.message?.content ?? 'ไม่สามารถตอบได้ในขณะนี้';
   return NextResponse.json({ response });
 }

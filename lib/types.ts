@@ -27,9 +27,16 @@ export interface StockQuote {
   category: 'index' | 'commodity' | 'crypto' | 'forex';
 }
 
+export interface AiAnalysis {
+  worldNews: string;
+  macroEconomy: string;
+  markets: string;
+  outlook: string;
+}
+
 export interface DashboardData {
   news: NewsArticle[];
-  newsSummary: string;
+  aiAnalysis: AiAnalysis | null;
   economics: EconomicIndicator[];
   stocks: StockQuote[];
   fetchedAt: number;

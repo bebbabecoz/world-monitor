@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server';
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import Groq from 'groq-sdk';
 import { getCached, getStaleCached, setCached } from '@/lib/cache';
 import type {
+  AiAnalysis,
   DashboardData,
   EconomicIndicator,
   NewsArticle,
@@ -25,10 +26,9 @@ async function timedFetch(url: string, timeoutMs = 20_000): Promise<Response> {
   }
 }
 
-// ─── GDELT + BBC RSS fallback ─────────────────────────────────────────────────
+// ─── News sources: GDELT → BBC → Al Jazeera → DW ────────────────────────────
 
 async function fetchFromGdelt(): Promise<NewsArticle[]> {
-  // GDELT DOC API requires OR terms inside parentheses
   const q = encodeURIComponent('(economy OR geopolitics OR war OR climate OR trade OR technology)');
   const url = `https://api.gdeltproject.org/api/v2/doc/doc?query=${q}&mode=artlist&maxrecords=15&format=json&timespan=24h`;
 
@@ -54,14 +54,8 @@ async function fetchFromGdelt(): Promise<NewsArticle[]> {
     }));
 }
 
-async function fetchFromBbcRss(): Promise<NewsArticle[]> {
-  const res = await timedFetch('https://feeds.bbci.co.uk/news/world/rss.xml', 15_000);
-  if (!res.ok) throw new Error(`BBC RSS ${res.status}`);
-
-  const xml = await res.text();
+function parseRssFeed(xml: string, domain: string): NewsArticle[] {
   const items: NewsArticle[] = [];
-
-  // Simple XML extraction without a library
   const itemBlocks = xml.match(/<item>([\s\S]*?)<\/item>/g) ?? [];
   for (const block of itemBlocks.slice(0, 15)) {
     const title = block.match(/<title><!\[CDATA\[(.*?)\]\]><\/title>/)?.[1]
@@ -69,13 +63,11 @@ async function fetchFromBbcRss(): Promise<NewsArticle[]> {
     const link = block.match(/<link>(.*?)<\/link>/)?.[1]
       ?? block.match(/<guid[^>]*>(https?[^<]+)<\/guid>/)?.[1] ?? '';
     const pubDate = block.match(/<pubDate>(.*?)<\/pubDate>/)?.[1] ?? '';
-
     if (!title || !link) continue;
     items.push({
-      title: title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>'),
+      title: title.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').trim(),
       url: link.trim(),
-      domain: 'bbc.co.uk',
-      // Store raw ISO string; parseGdeltDate in NewsCard handles both formats
+      domain,
       seendate: pubDate ? new Date(pubDate).toISOString() : '',
       language: 'English',
     });
@@ -83,16 +75,41 @@ async function fetchFromBbcRss(): Promise<NewsArticle[]> {
   return items;
 }
 
+async function fetchFromRss(url: string, domain: string): Promise<NewsArticle[]> {
+  const res = await timedFetch(url, 15_000);
+  if (!res.ok) throw new Error(`${domain} RSS ${res.status}`);
+  const xml = await res.text();
+  const items = parseRssFeed(xml, domain);
+  if (items.length === 0) throw new Error(`${domain} RSS returned 0 items`);
+  return items;
+}
+
+const RSS_FALLBACKS: Array<{ url: string; domain: string; label: string }> = [
+  { url: 'https://feeds.bbci.co.uk/news/world/rss.xml',  domain: 'bbc.co.uk',       label: 'BBC'         },
+  { url: 'https://www.aljazeera.com/xml/rss/all.xml',     domain: 'aljazeera.com',   label: 'Al Jazeera'  },
+  { url: 'https://rss.dw.com/xml/rss-en-world',           domain: 'dw.com',          label: 'DW'          },
+];
+
 async function fetchNews(): Promise<NewsArticle[]> {
-  // Try GDELT first, fall back to BBC RSS on any failure
   try {
     const articles = await fetchFromGdelt();
     if (articles.length > 0) return articles;
     throw new Error('GDELT returned 0 articles');
   } catch (gdeltErr) {
-    console.warn('[dashboard] GDELT failed, trying BBC RSS:', String(gdeltErr));
-    return fetchFromBbcRss();
+    console.warn('[dashboard] GDELT failed, trying RSS fallbacks:', String(gdeltErr));
   }
+
+  for (const { url, domain, label } of RSS_FALLBACKS) {
+    try {
+      const articles = await fetchFromRss(url, domain);
+      console.log(`[dashboard] News loaded from ${label} (${articles.length} articles)`);
+      return articles;
+    } catch (e) {
+      console.warn(`[dashboard] ${label} RSS failed:`, String(e));
+    }
+  }
+
+  throw new Error('All news sources failed (GDELT + BBC + Al Jazeera + DW)');
 }
 
 // ─── World Bank ───────────────────────────────────────────────────────────────
@@ -180,101 +197,122 @@ const SYMBOLS: Array<{ symbol: string; name: string; nameThai: string; category:
   { symbol: 'DX-Y.NYB', name: 'USD Index',   nameThai: 'ดอลลาร์ Index', category: 'forex'     },
 ];
 
-type QuoteResult = {
+// ─── Yahoo Finance v8 direct (no crumb required) ─────────────────────────────
+
+type V8Meta = {
   regularMarketPrice?: number;
-  regularMarketChange?: number;
-  regularMarketChangePercent?: number;
+  chartPreviousClose?: number;
   currency?: string;
 };
 
-type YFModule = {
-  quote(s: string): Promise<QuoteResult>;
-  suppressNotices(notices: string[]): void;
-};
+async function fetchYahooV8(symbol: string): Promise<StockQuote & { symbol: string }> {
+  const encoded = encodeURIComponent(symbol);
+  const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encoded}?interval=1d&range=1d`;
+  const res = await timedFetch(url, 10_000);
+  if (!res.ok) throw new Error(`YF v8 ${res.status} for ${symbol}`);
 
-// Singleton — preserves the Yahoo Finance crumb/cookie across requests
-let _yfInstance: YFModule | null = null;
-async function getYFInstance(): Promise<YFModule> {
-  if (_yfInstance) return _yfInstance;
-  const mod = await import('yahoo-finance2');
-  const raw = mod.default as unknown as YFModule;
-  _yfInstance = raw;
-  // Suppress the one-time survey prompt from cluttering logs
-  try { _yfInstance.suppressNotices(['yahooSurvey']); } catch { /* ignore */ }
-  return _yfInstance;
+  const data = (await res.json()) as { chart?: { result?: Array<{ meta?: V8Meta }> } };
+  const meta = data.chart?.result?.[0]?.meta;
+  if (!meta?.regularMarketPrice) throw new Error(`YF v8 no price for ${symbol}`);
+
+  const price = meta.regularMarketPrice;
+  const prev  = meta.chartPreviousClose ?? price;
+  const change = price - prev;
+  const changePercent = prev ? (change / prev) * 100 : 0;
+
+  return { symbol, price, change, changePercent, currency: meta.currency ?? 'USD' };
 }
 
 function resetYFInstance() { _yfInstance = null; }
 
 async function fetchStocks(): Promise<StockQuote[]> {
-  const yf = await getYFInstance();
   const results: StockQuote[] = [];
   let failCount = 0;
-  let crumbFailed = false;
 
   for (const { symbol, name, nameThai, category } of SYMBOLS) {
     try {
-      const q = await yf.quote(symbol);
-      results.push({
-        symbol, name, nameThai, category,
-        price: q.regularMarketPrice ?? 0,
-        change: q.regularMarketChange ?? 0,
-        changePercent: q.regularMarketChangePercent ?? 0,
-        currency: q.currency ?? 'USD',
-      });
+      const q = await fetchYahooV8(symbol);
+      results.push({ symbol, name, nameThai, category, price: q.price, change: q.change, changePercent: q.changePercent, currency: q.currency });
     } catch (e) {
       failCount++;
-      const msg = String(e);
-      if (!crumbFailed && (msg.includes('crumb') || msg.includes('429'))) {
-        crumbFailed = true;
-        // Reset singleton so next request gets a fresh crumb after rate limit window
-        resetYFInstance();
-        console.warn(`[dashboard] YF crumb/rate-limit error for ${symbol}, reset singleton`);
-      }
+      console.warn(`[dashboard] YF v8 failed for ${symbol}:`, String(e).slice(0, 80));
     }
-    // Small delay between requests to avoid triggering Yahoo's rate limit
-    await new Promise((r) => setTimeout(r, 150));
+    await new Promise((r) => setTimeout(r, 100));
   }
 
-  if (failCount > 0) {
-    console.warn(`[dashboard] ${failCount}/${SYMBOLS.length} YF quotes failed`);
-  }
-  if (results.length === 0) {
-    throw new Error(`All ${SYMBOLS.length} Yahoo Finance quotes failed (429/crumb)`);
-  }
+  if (failCount > 0) console.warn(`[dashboard] ${failCount}/${SYMBOLS.length} YF quotes failed`);
+  if (results.length === 0) throw new Error(`All ${SYMBOLS.length} Yahoo Finance v8 quotes failed`);
   return results;
 }
 
-// ─── Gemini summary ───────────────────────────────────────────────────────────
+// ─── AI Analysis ─────────────────────────────────────────────────────────────
 
-async function generateNewsSummary(articles: NewsArticle[]): Promise<string> {
-  const key = process.env.GEMINI_API_KEY;
-  if (!key) return 'ไม่สามารถสร้างสรุปข่าวได้ (กรุณาตั้งค่า GEMINI_API_KEY ใน .env.local)';
+async function generateAnalysis(
+  news: NewsArticle[],
+  economics: EconomicIndicator[],
+  stocks: StockQuote[],
+): Promise<AiAnalysis> {
+  const key = process.env.GROQ_API_KEY;
+  if (!key) throw new Error('GROQ_API_KEY not set');
 
-  const list = articles
-    .slice(0, 10)
+  const newsList = news.slice(0, 12)
     .map((a, i) => `${i + 1}. ${a.title} [${a.domain}]`)
     .join('\n');
 
-  const prompt = `คุณคือนักวิเคราะห์ข่าวระดับอาวุโสที่เชี่ยวชาญด้านภูมิรัฐศาสตร์และเศรษฐกิจโลก
+  const econList = economics
+    .map((e) => `${e.countryName} ${e.nameThai}: ${e.value?.toFixed(2)}% (${e.year})`)
+    .join(' | ');
 
-ข่าวสำคัญ 24 ชั่วโมงที่ผ่านมา:
-${list}
+  const stockList = stocks
+    .map((s) => {
+      const sign = s.changePercent >= 0 ? '+' : '';
+      return `${s.nameThai}: ${s.price.toLocaleString()} (${sign}${s.changePercent.toFixed(2)}%)`;
+    })
+    .join(' | ');
 
-วิเคราะห์และสรุปสถานการณ์โลกเป็นภาษาไทย โดย:
-• ระบุประเด็นสำคัญ 3–4 ประเด็นที่กำลังขับเคลื่อนโลกในขณะนี้
-• วิเคราะห์แนวโน้มและผลกระทบที่อาจเกิดขึ้นในระยะสั้น
-• ใช้ภาษาวิชาการแต่อ่านง่าย ไม่ใช้ Bullet Point — เขียนเป็นย่อหน้า
-• ความยาว 150–200 คำ`;
+  const prompt = `คุณคือนักวิเคราะห์ระดับอาวุโสที่เชี่ยวชาญด้านภูมิรัฐศาสตร์ เศรษฐกิจโลก และตลาดการเงิน
 
-  const genAI = new GoogleGenerativeAI(key);
-  // gemini-2.0-flash-lite: higher free-tier quota than gemini-2.0-flash
-  const model = genAI.getGenerativeModel(
-    { model: 'gemini-2.0-flash-lite' },
-    { apiVersion: 'v1' },
-  );
-  const result = await model.generateContent(prompt);
-  return result.response.text();
+ข้อมูลล่าสุด ณ วันนี้:
+
+[ข่าวรอบโลก 24 ชั่วโมง]
+${newsList}
+
+[ข้อมูลเศรษฐกิจมหภาค - World Bank]
+${econList || 'ไม่มีข้อมูล'}
+
+[ราคาตลาดการเงินล่าสุด]
+${stockList || 'ไม่มีข้อมูล'}
+
+วิเคราะห์ข้อมูลทั้งหมดด้านบนเป็นภาษาไทย และตอบในรูปแบบ JSON เท่านั้น ห้ามมีข้อความนอก JSON:
+
+{
+  "worldNews": "สรุปข่าวรอบโลกที่สำคัญวันนี้ ระบุประเด็นหลัก 3-4 เรื่องที่กำลังเกิดขึ้น เขียนเป็นย่อหน้า 80-100 คำ",
+  "macroEconomy": "วิเคราะห์เศรษฐกิจมหภาคโลก อ้างอิงตัวเลข GDP เงินเฟ้อ การว่างงาน ของแต่ละประเทศ บอกแนวโน้มและนัยสำคัญ เขียนเป็นย่อหน้า 80-100 คำ",
+  "markets": "วิเคราะห์ตลาดหุ้น สินค้าโภคภัณฑ์ คริปโต และค่าเงิน อ้างอิงตัวเลขและเปอร์เซ็นต์การเปลี่ยนแปลง บอกว่าตลาดโดยรวมเป็นอย่างไร เขียนเป็นย่อหน้า 80-100 คำ",
+  "outlook": "วิเคราะห์ทิศทางและแนวโน้มระยะสั้น (1-4 สัปดาห์) ของประเด็นสำคัญ เช่น สงคราม ความตึงเครียดทางการค้า ทิศทางเศรษฐกิจ ความเสี่ยงที่ต้องติดตาม เขียนเป็นย่อหน้า 80-100 คำ"
+}`;
+
+  const groq = new Groq({ apiKey: key });
+  const completion = await groq.chat.completions.create({
+    model: 'llama-3.3-70b-versatile',
+    messages: [
+      { role: 'system', content: 'ตอบด้วย JSON เท่านั้น ห้ามมีข้อความอื่น ห้ามใช้ markdown code block' },
+      { role: 'user', content: prompt },
+    ],
+    temperature: 0.6,
+    max_tokens: 1200,
+    response_format: { type: 'json_object' },
+  });
+
+  const text = completion.choices[0]?.message?.content ?? '{}';
+  const parsed = JSON.parse(text) as Partial<AiAnalysis>;
+
+  return {
+    worldNews:    parsed.worldNews    ?? 'ไม่สามารถวิเคราะห์ได้',
+    macroEconomy: parsed.macroEconomy ?? 'ไม่สามารถวิเคราะห์ได้',
+    markets:      parsed.markets      ?? 'ไม่สามารถวิเคราะห์ได้',
+    outlook:      parsed.outlook      ?? 'ไม่สามารถวิเคราะห์ได้',
+  };
 }
 
 // ─── Route handler ────────────────────────────────────────────────────────────
@@ -314,21 +352,19 @@ export async function GET(req: Request) {
     errors.stocks = 'ข้อมูลตลาดหุ้น (Yahoo Finance) ไม่สามารถโหลดได้ในขณะนี้';
   }
 
-  let newsSummary = 'ไม่มีข้อมูลข่าวสำหรับสรุปในขณะนี้';
-  if (news.length > 0) {
+  let aiAnalysis: AiAnalysis | null = null;
+  if (news.length > 0 || economics.length > 0 || stocks.length > 0) {
     try {
-      newsSummary = await generateNewsSummary(news);
+      aiAnalysis = await generateAnalysis(news, economics, stocks);
     } catch (e) {
-      console.error('[dashboard] Gemini failed:', e);
-      newsSummary = 'ไม่สามารถสร้างสรุปข่าวด้วย AI ได้ในขณะนี้ กรุณาลองใหม่อีกครั้ง';
-      errors.summary = 'Gemini unavailable';
+      console.error('[dashboard] AI analysis failed:', e);
+      errors.summary = 'AI วิเคราะห์ไม่สำเร็จในขณะนี้';
     }
   }
 
   const hasAnyData = news.length > 0 || economics.length > 0 || stocks.length > 0;
 
   if (!hasAnyData) {
-    // All sources failed — return stale data if available, with a warning
     const stale = getStaleCached<DashboardData>(STALE_KEY);
     if (stale) {
       const ageMin = Math.round(stale.ageMs / 60_000);
@@ -344,10 +380,9 @@ export async function GET(req: Request) {
         },
       });
     }
-    // No stale data either — return errors
     return NextResponse.json({
       news: [],
-      newsSummary: 'ระบบภายนอกทั้งหมดขัดข้องชั่วคราว กรุณารอสักครู่แล้วรีเฟรชใหม่',
+      aiAnalysis: null,
       economics: [],
       stocks: [],
       fetchedAt: Date.now(),
@@ -359,7 +394,7 @@ export async function GET(req: Request) {
 
   const data: DashboardData = {
     news,
-    newsSummary,
+    aiAnalysis,
     economics,
     stocks,
     fetchedAt: Date.now(),
