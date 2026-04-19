@@ -73,8 +73,9 @@ ${context}
 5. ไม่แนะนำให้ซื้อขายหลักทรัพย์โดยตรง`;
 
   const genAI = new GoogleGenerativeAI(apiKey);
+  // gemini-2.0-flash-lite: higher free-tier quota than gemini-2.0-flash
   const model = genAI.getGenerativeModel(
-    { model: 'gemini-2.0-flash', systemInstruction },
+    { model: 'gemini-2.0-flash-lite', systemInstruction },
     { apiVersion: 'v1' },
   );
 
